@@ -8,8 +8,8 @@ import argparse
 import requests
 import os
 
-# Parse command-line arguments for precision
-parser = argparse.ArgumentParser(description="Precision options for InceptionV3 inference")
+# 1. Parse command-line arguments
+parser = argparse.ArgumentParser(description="Precision options for ResNet50 inference")
 parser.add_argument(
     "--precision",
     type=str,
@@ -20,58 +20,63 @@ parser.add_argument(
 parser.add_argument(
     "--ep",
     type=str,
-    choices=["rocm", "migx", "cuda", "openvino"],
-    default="rocm",
-    help="Set the execution provider for inference: rocm, migx, cuda, openvino, cpu"
+    choices=["rocm", "migx", "cuda", "openvino", "cpu"],
+    default="cpu",
+    help="Set the execution provider for inference"
 )
 args = parser.parse_args()
 
-# Set the execution provider
-execution_provider = None
-if args.ep == "rocm":
-    execution_provider = "ROCMExecutionProvider"
-elif args.ep == "migx":
-    execution_provider = "MIGraphXExecutionProvider"
-elif args.ep == "cuda":
-    execution_provider = "CUDAExecutionProvider"
-elif args.ep == "openvino":
-    execution_provider = "OpenVINOExecutionProvider"
-elif args.ep == "cpu":
-    execution_provider = "CPUExecutionProvider"
-    
-# Set the model
-model_name = None
-if args.precision == "fp32":
-    model_name = "resnet50_model.onnx"
-elif args.precision == "fp16":
-    model_name = "resnet50_model_fp16.onnx"
-elif args.precision == "mixed":
-    model_name = "resnet50_model_mixed.onnx"
-elif args.precision == "int8":
-    model_name = "resnet50-v1-12-int8.onnx"
+# 2. Map Execution Provider
+ep_map = {
+    "rocm": "ROCMExecutionProvider",
+    "migx": "MIGraphXExecutionProvider",
+    "cuda": "CUDAExecutionProvider",
+    "openvino": "OpenVINOExecutionProvider",
+    "cpu": "CPUExecutionProvider"
+}
+execution_provider = ep_map.get(args.ep)
 
-# Download INT8 model from ONNX Model Zoo
-output_file = "resnet50-v1-12-int8.onnx"
+# 3. Set Model Filename
+model_name = {
+    "fp32": "resnet50_model.onnx",
+    "fp16": "resnet50_model_fp16.onnx",
+    "mixed": "resnet50_model_mixed.onnx",
+    "int8": "resnet50-v1-12-int8.onnx"
+}.get(args.precision)
 
-if args.precision == "int8":
-    if not os.path.exists(output_file):    
-        try:
-            url = "https://github.com/onnx/models/raw/refs/heads/main/validated/vision/classification/resnet/model/resnet50-v1-12-int8.onnx?download="
-            response = requests.get(url)
-            response.raise_for_status()
-            with open(output_file, "wb") as file:
-                file.write(response.content)
-            print(f"ResNet50 INT8 ONNX model downloaded successfully")
-        except requests.exceptions.RequestException as e:
-            print(f"Error occured: {e}")
+# 4. Handle INT8 Download if missing
+if args.precision == "int8" and not os.path.exists(model_name):
+    print(f"Downloading {model_name}...")
+    try:
+        url = "https://github.com/onnx/models/raw/refs/heads/main/validated/vision/classification/resnet/model/resnet50-v1-12-int8.onnx?download="
+        response = requests.get(url)
+        response.raise_for_status()
+        with open(model_name, "wb") as f:
+            f.write(response.content)
+        print("Download successful.")
+    except Exception as e:
+        print(f"Download failed: {e}")
+        exit(1)
 
-# Read the categories
-with open("imagenet_classes.txt", "r") as f:
-    categories = [s.strip() for s in f.readlines()]
+# 5. Load Model Session
+if not os.path.exists(model_name):
+    print(f"Error: Model file {model_name} not found. Please ensure the file exists.")
+    exit(1)
 
-# Pre-process the image for ResNet-50 inference
-filename = 'cat.jpg'  # change to your filename
-input_image = Image.open(filename)
+session = onnxruntime.InferenceSession(model_name, providers=[execution_provider])
+
+# FIX: Dynamically identify the input name (avoids the "x" vs "input.1" error)
+input_node = session.get_inputs()[0]
+input_label = input_node.name
+print(f"Model loaded. Detected input name: '{input_label}'")
+
+# 6. Image Pre-processing
+filename = 'cat.jpg'  # Ensure this file exists in your directory
+if not os.path.exists(filename):
+    print(f"Error: {filename} not found. Please provide an image.")
+    exit(1)
+
+input_image = Image.open(filename).convert('RGB')
 preprocess = T.Compose([
     T.Resize(256),
     T.CenterCrop(224),
@@ -79,58 +84,48 @@ preprocess = T.Compose([
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 input_tensor = preprocess(input_image)
-
-# Adjust tensor size for model (all precisions)
 input_batch = input_tensor.unsqueeze(0)
 
-# Move the input and model to the GPU
-print("GPU Availability: ", torch.cuda.is_available())
-if torch.cuda.is_available():
-    input_batch = input_batch.to('cuda')
-else:
-    print("GPU is not available!")
+# 7. Match Precision for Input Data
+# Convert to Numpy and ensure the data type matches the model's requirements
+input_data = input_batch.numpy()
 
-# If fp16, convert the input tensor to an fp16 numpy array
 if args.precision == "fp16":
-    if torch.cuda.is_available():
-        input_batch = input_batch.to(torch.float16)
-    else:
-        print("GPU is not available!")
+    input_data = input_data.astype(np.float16)
+elif args.precision == "int8":
+    # Note: Most ONNX INT8 models still take FP32 input and quantize internally
+    input_data = input_data.astype(np.float32)
 
-# Set Execution Provider for ONNX Runtime
-session = onnxruntime.InferenceSession(model_name, providers=[execution_provider])
+# 8. Warm up run
+print("Running warm-up...")
+_ = session.run([], {input_label: input_data})
 
-# Set input name
-if args.precision == "int8":
-    input_label = 'data'
-else:
-    input_label = 'input.1'
+# 9. Measured Inference
+print("Running timed inference...")
+iterations = 10
+start_time = time.time()
 
-# Warm up run to load model and data onto the GPU
-if torch.cuda.is_available():
-    input_batch = input_batch.cpu()
-ort_outputs = session.run([], {input_label: input_batch.numpy()})[0]
+for _ in range(iterations):
+    ort_outputs = session.run([], {input_label: input_data})[0]
 
-# Run inference with ONNX Runtime
-latency = []
-torch.cuda.synchronize()
-start = time.time()
+end_time = time.time()
+avg_latency = ((end_time - start_time) / iterations) * 1000
 
-if torch.cuda.is_available():
-    input_batch = input_batch.cpu()
-ort_outputs = session.run([], {input_label: input_batch.numpy()})[0]
+# 10. Process Results
+# Read categories (ensure imagenet_classes.txt is present)
+try:
+    with open("imagenet_classes.txt", "r") as f:
+        categories = [s.strip() for s in f.readlines()]
+except FileNotFoundError:
+    categories = [f"Class {i}" for i in range(1000)]
 
-torch.cuda.synchronize()
-end = time.time()
-latency.append(end - start)
-
-# Process ONNX Runtime outputs
 output = ort_outputs.flatten()
-output = np.exp(output - np.max(output)) / np.sum(np.exp(output - np.max(output)))  # softmax
+# Softmax
+output = np.exp(output - np.max(output)) / np.sum(np.exp(output - np.max(output)))
 top5_catid = np.argsort(-output)[:5]
 
-# Show top categories per image
-for i in range(len(top5_catid)):
-    print(categories[top5_catid[i]], output[top5_catid[i]])
+print("\n--- Results ---")
+for i in top5_catid:
+    print(f"{categories[i]}: {output[i]:.4f}")
 
-print("ONNX Inference Time = {} ms\n".format(format(sum(latency) * 1000 / len(latency), '.2f')))
+print(f"\nAverage ONNX Inference Time: {avg_latency:.2f} ms")
